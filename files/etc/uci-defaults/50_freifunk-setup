@@ -1,0 +1,775 @@
+#!/bin/sh
+
+# Setup the system for the initial Freifunk configuration.
+# This script is only run once on first boot and is deleted afterwards.
+
+exec >/root/freifunk_setup.log 2>&1
+
+. /lib/functions.sh
+
+random_mac() {
+	echo -n 02; dd bs=1 count=5 if=/dev/urandom 2>/dev/null | hexdump -v -e '/1 ":%02x"'
+}
+
+initial_wifi_setup()
+{
+	echo "(I) Setup /etc/config/wireless"
+
+	# AP default SSID
+	local ap_ssid="$(uci get freifunk.@settings[0].community).freifunk.net"
+
+	# Get 802.11s default mesh id
+	local mesh_id="$(uci get freifunk.@settings[0].default_mesh_id)"
+
+	# Delete all wifi interfaces
+	while uci -q delete wireless.@wifi-iface[0]; do :; done
+
+	# Create an AP and mesh interface for each wifi device
+	config_wifi() {
+		local ds="$1" #device section
+		local ah_ok=0 ap_ok=0 #interface status
+		local wifi_device=`uci -q get wireless.$ds.device`
+		local wifi_path=`uci -q get wireless.$ds.path`
+		local h n p
+
+		[ -z "$wifi_device" ] && wifi_device="$ds"
+
+		echo "(I) Configure wifi device: '$wifi_device'"
+
+		if [ `uci get wireless.$ds.channel` -gt 35 ]; then
+			uci set wireless.$ds.channel=36
+		else
+			uci set wireless.$ds.channel=1
+		fi
+
+		uci set wireless.$ds.country='DE'
+		uci set wireless.$ds.disabled='0'
+		# Not a valid value, but will be ignored otherwise (for web ui)
+		uci set wireless.$ds.txpower='auto'
+
+		# Mesh interface
+		h="wireless.${wifi_device}_mesh"
+		uci set $h="wifi-iface"
+		uci set $h.device="$wifi_device"
+		uci set $h.mode="mesh"
+		uci set $h.network="${wifi_device}_mesh"
+		uci set $h.mesh_id="$mesh_id"
+		uci set $h.mesh_fwding=0
+
+		# Additional config for mesh interface
+		n="network.${wifi_device}_mesh"
+		uci set $n="interface"
+		uci set $n.mtu=1532
+		uci set $n.proto="batadv_hardif"
+		uci set $n.master="bat0"
+
+		# AP interface
+		p="wireless.${wifi_device}_ap"
+		uci set $p="wifi-iface"
+		uci set $p.device="$wifi_device"
+		uci set $p.mode=ap
+		uci set $p.network=freifunk
+		uci set $p.ssid="$ap_ssid"
+		uci set $p.encryption="none"
+	}
+
+	config_load wireless
+	config_foreach config_wifi wifi-device
+}
+
+initial_lan_setup()
+{
+	echo "(I) Setup lan network."
+
+	local lan_interfaces="$1"
+
+	uci -q delete network.lan
+	uci set network.lan="interface"
+	uci set network.lan.type="bridge"
+	uci set network.lan.ifname="$lan_interfaces"
+	uci -q delete network.lan.ip6addr
+	uci -q delete network.lan.ipaddr
+	uci add_list network.lan.ipaddr="192.168.133.1"
+	uci set network.lan.proto=static
+	uci set network.lan.netmask="255.255.255.0"
+	uci set network.lan.igmp_snooping="0"
+	uci set network.lan.force_link="1"
+	uci set network.lan.bridge_empty="1"
+}
+
+initial_freifunk_setup()
+{
+	echo "(I) Setup freifunk network."
+
+	local freifunk_interfaces="$1"
+	local freifunk_mac="$2"
+
+	uci -q delete network.freifunk
+	uci set network.freifunk="interface"
+	uci set network.freifunk.type="bridge"
+	uci set network.freifunk.ifname="$freifunk_interfaces"
+	uci set network.freifunk.macaddr="$freifunk_mac"
+	uci -q delete network.freifunk.ip6addr
+	uci -q delete network.freifunk.ipaddr
+	uci set network.freifunk.proto=static
+	uci set network.freifunk.netmask="255.255.0.0"
+	uci set network.freifunk.igmp_snooping="0"
+	uci set network.freifunk.force_link="1"
+	uci set network.freifunk.bridge_empty="1"
+
+	uci set network.freifunk6="interface"
+	uci set network.freifunk6.ifname="@freifunk"
+	uci set network.freifunk6.proto="dhcpv6"
+	uci set network.freifunk6.reqaddress="none" #slaac only
+	uci set network.freifunk6.reqprefix="no" #disable dhcpv6 /128 request
+}
+
+initial_local_node_setup()
+{
+	echo "(I) Setup IPv4 local node access."
+
+	local addr4="10.33.127.0"
+	local addr6="$(uci get network.globals.ula_prefix)"
+
+	uci add_list network.freifunk.ipaddr="$addr4"
+	uci add_list network.freifunk.ip6addr="$addr6"
+
+	cat >> /etc/firewall.user <<-  EOF
+	# Isolate local-node IPv4 address
+	ebtables -A FORWARD --logical-out br-freifunk -o bat0 -p arp --arp-ip-dst $addr4 -j DROP
+	ebtables -A OUTPUT --logical-out br-freifunk -o bat0 -p arp --arp-ip-dst $addr4 -j DROP
+	ebtables -A FORWARD --logical-out br-freifunk -o bat0 -p IPv4 --ip-source $addr4 -j DROP
+	ebtables -A OUTPUT --logical-out br-freifunk -o bat0 -p IPv4 --ip-source $addr4 -j DROP
+
+	# Isolate local-node IPv6 address
+	# WARNING - wrong setting here can cause Autoupdater to be blocked - WARNING
+	ebtables -A FORWARD --logical-out br-freifunk -o bat0 -p IPv6 --ip6-dst ${addr6%/*}/128 -j DROP
+	ebtables -A FORWARD --logical-out br-freifunk -o bat0 -p IPv6 --ip6-dst ${addr6%/*}/128 -j DROP
+	EOF
+}
+
+initial_wan_setup()
+{
+	echo "(I) Setup WAN network."
+
+	local wan_interfaces="$1"
+	local wan_mac="$2"
+
+	# Remoe old sections if present
+	uci -q delete network.wan
+	uci -q delete network.wan6
+
+	uci set network.wan="interface"
+	uci set network.wan.type="bridge"
+	uci set network.wan.ifname="$wan_interfaces"
+	uci set network.wan.proto="dhcp"
+	uci set network.wan.macaddr="$wan_mac"
+	uci set network.wan.bridge_empty="1"
+
+	uci set network.wan6="interface"
+	uci set network.wan6.ifname="@wan"
+	uci set network.wan6.proto="dhcpv6"
+	# Add the default route for wan to table 1
+	uci set network.wan6.ip6table="1"
+
+	# Use table 1 also for all traffic marked by mark 1 (fastd)
+	uci set network.wan6_lookup="rule6"
+	uci set network.wan6_lookup.mark="0x01/0x01"
+	uci set network.wan6_lookup.lookup="1"
+
+	uci set network.wan6_unreachable="route6"
+	uci set network.wan6_unreachable.type="unreachable"
+	uci set network.wan6_unreachable.table="1"
+	uci set network.wan6_unreachable.target="::/0"
+	uci set network.wan6_unreachable.metric="65535"
+	uci set network.wan6_unreachable.gateway="::"
+	uci set network.wan6_unreachable.interface="loopback"
+}
+
+initial_batman_setup()
+{
+	local n
+
+	echo "(I) Add network sections to add fastd to batman-adv and set MTU."
+
+	n=network.fastd_mesh
+	uci set $n=interface
+	uci set $n.ifname='fastd_mesh'
+	uci set $n.mtu=1406
+	uci set $n.proto='batadv_hardif'
+	uci set $n.master='bat0'
+
+	n=network.bat0
+	uci set $n=interface
+	uci set $n.proto='batadv'
+	uci set $n.routing_algo='BATMAN_V'
+	uci set $n.orig_interval=30000
+	uci set $n.gw_mode='client'
+	uci set $n.multicast_mode=1
+}
+
+initial_setup()
+{
+	local prefix="fdef:17a0:fff1:300::/64"
+
+	local wan_interface=$(uci -q get network.wan.ifname)
+	echo "(I) WAN interface: '$wan_interface'"
+
+	local lan_interface=$(uci -q get network.lan.ifname)
+	echo "(I) LAN interface: '$lan_interface'"
+
+	local mesh_id=$(uci -q get freifunk.@settings[0].default_mesh_id)
+	echo "(I) Mesh ID: '$mesh_id'"
+
+	echo "(I) Set empty root password."
+	(echo ""; sleep 1; echo "") | passwd > /dev/null
+
+	# Get a unique MAC address to identify the node
+	local mac="$(cat /sys/class/ieee80211/phy0/macaddress 2> /dev/null)"
+	if [ -z "$mac" -o "$mac" = "00:11:22:33:44:55" ]; then
+		mac="$(cat /sys/class/net/eth0/address)"
+		if [ -z "$mac" -o "$mac" = "00:11:22:33:44:55" ]; then
+			# Random MAC address
+			mac="$(random_mac)"
+		fi
+	fi
+
+	local mac_ga="$mac"
+	# Translate to local administered mac
+	a=${mac%%:*} #cut out first hex
+	a=$((0x$a ^ 2)) #flip second bit
+	a=`printf '%02x\n' $a` #convert to hex
+	local mac_la="$a:${mac#*:}" #reassemble mac
+
+	echo "(I) MAC: '$mac'"
+
+	echo "(I) Set Prefix and populate /etc/hosts."
+
+	uci -q set network.globals="globals"
+	uci set network.globals.ula_prefix="$prefix"
+	echo "10.33.127.0 node" >> /etc/hosts
+
+	# ------------------------------------------- #
+	# S E T U P  W I R E L E S S #
+	# ------------------------------------------- #
+
+	initial_wifi_setup
+
+	# ------------------------------------- #
+	# L A N  S E T U P #
+	# ------------------------------------- #
+
+	initial_lan_setup "$lan_interface"
+
+	# ------------------------------------- #
+	# F R E I F U N K  S E T U P #
+	# ------------------------------------- #
+
+	initial_freifunk_setup "bat0" "$mac_la"
+
+	# ------------------------------------- #
+	# W A N  S E T U P #
+	# ------------------------------------- #
+
+	initial_wan_setup "$wan_interface" "$mac_ga"
+
+	# ------------------------------------- #
+	# B A T M A N  S E T U P #
+	# ------------------------------------- #
+
+	initial_batman_setup
+
+	# ------------------------------------- #
+	# M I S C  S E T U P #
+	# ------------------------------------- #
+
+	case "$(cat /tmp/sysinfo/model)" in
+		"TP-Link TL-WR1043N/ND v2" | "TP-Link TL-WR1043N/ND v3")
+			# Special WR1043v2 switch fixup for the webui
+			uci set network.@switch_vlan[-2].ports="1 2 3 4 0t"
+			uci set network.@switch_vlan[-1].ports="5 0t"
+			uci set network.lan.ifname="eth1.1"
+			uci set network.wan.ifname="eth1.2"
+			uci commit network
+			;;
+		"TP-Link Archer C7 v2")
+			# Special Archer C7 v2 switch fixup for the webui
+			uci set network.@switch_vlan[-2].ports="2 3 4 5 0t"
+			uci set network.@switch_vlan[-1].ports="1 6 0t"
+			uci set network.lan.ifname="eth1.1"
+			uci set network.wan.ifname="eth1.2"
+			uci commit network
+			;;
+	esac
+
+	# Allow access of the local node using a common IP address
+	initial_local_node_setup
+
+	# Reduce NDP traffic
+	cat >> /etc/sysctl.conf <<-  EOF
+
+	# increase neighbor table timings by a factor of 10
+	net.ipv6.neigh.default.gc_interval=300
+	net.ipv6.neigh.default.gc_stale_time=600
+	net.ipv6.neigh.default.base_reachable_time_ms=300
+
+	# by default, either accept_ra or forwarding is enabled
+	# disable both here, since LEDE handles both apart from the Linux kernel
+	net.ipv6.conf.all.accept_ra=0
+	net.ipv6.conf.default.accept_ra=0
+	net.ipv6.conf.br-freifunk.forwarding=0
+	net.ipv6.conf.br-lan.forwarding=0
+
+	#reboot on out of memory
+	vm.panic_on_oom=1
+
+	EOF
+
+	uci set system.@system[0].timezone='CET-1CEST,M3.5.0,M10.5.0/3'
+
+	# Write everything to flash
+	uci commit
+}
+
+update_050_to_051()
+{
+	cp /rom/etc/uhttpd.crt /etc/ 2> /dev/null
+	cp /rom/etc/uhttpd.key /etc/ 2> /dev/null
+
+	# Update autoupdater
+	local updater_enabled=$(uci get autoupdater.settings.enabled)
+	cp /rom/etc/config/autoupdater /etc/config/autoupdater
+	uci set autoupdater.settings.enabled="$updater_enabled"
+	uci commit autoupdater
+
+	# Use option instead of list
+	uci delete fastd.default.bind
+	uci set fastd.default.bind='any interface "br-wan"'
+	uci commit fastd
+
+	# Set txpower for the web ui to show a selection (again)
+	wireless_set_txpower() {
+		local cfg="$1" txpower
+
+		config_get txpower $cfg "txpower"
+
+		[ -n "$txpower" ] || uci set wireless.$cfg.txpower="auto"
+	}
+
+	# Make sure the is no macaddr set, some drivers have problems
+	wireless_remove_macaddr() {
+		local cfg="$1" macaddr
+
+		config_get macaddr $cfg "macaddr"
+		[ -n "$macaddr" ] && uci delete wireless.$cfg.macaddr
+	}
+
+	config_load wireless
+	config_foreach wireless_set_txpower wifi-device
+	config_foreach wireless_remove_macaddr wifi-iface
+	uci commit wireless
+}
+
+update_051_to_060()
+{
+	# Preserve self signed certificates
+	cp /rom/etc/uhttpd.crt /etc/ 2> /dev/null
+	cp /rom/etc/uhttpd.key /etc/ 2> /dev/null
+
+	# Update fastd configuration
+	cp /rom/etc/config/fastd /etc/config/fastd
+
+	local geo="$(uci -q get freifunk.@settings[0].geo)"
+	local publish_map="$(uci -q get freifunk.@settings[0].publish_map)"
+
+	# Replace geo by latitude / longitude
+	[  -n "$geo" ] && {
+		uci set freifunk.@settings[0].latitude="${geo%% *}"
+		uci set freifunk.@settings[0].longitude="${geo##* }"
+		uci delete freifunk.@settings[0].geo
+	}
+
+	# Change publish_map values
+	if [ "$publish_map" = "0" ]; then
+		uci set freifunk.@settings[0].publish_map="none"
+	else
+		uci set freifunk.@settings[0].publish_map="basic"
+	fi
+
+	# Introduce new setting
+	uci set freifunk.@settings[0].mesh_on_wan=0
+
+	# Rename option access_from to allow_access_from
+	uci rename freifunk.@settings[0].access_from=allow_access_from
+
+	# Add community_url variable
+	uci set freifunk.@settings[0].community_url="http://freifunk-schwaben.de"
+
+	uci commit freifunk
+
+	# Set batman-adv mtu for wireless interfaces
+	network_set_mesh_mtu() {
+		local cfg="$1" network
+
+		config_get network $cfg "network"
+		if [ -n "$network" -a "$(uci -q get network.$network.proto)" = "batadv" ]; then
+			uci set network.$network.mtu=1532
+		fi
+	}
+
+	config_load wireless
+	config_foreach network_set_mesh_mtu wifi-iface
+
+	remove_ula() {
+		case "$1" in
+			*ff:fe*)
+				uci del_list network.freifunk.ip6addr="$1"
+				;;
+		esac
+	}
+
+	# Remove ULA address
+	config_load network
+	config_list_foreach freifunk ip6addr remove_ula
+
+	uci commit network
+}
+
+update_060_to_061()
+{
+	# Preserve self signed certificates
+	cp /rom/etc/uhttpd.crt /etc/ 2> /dev/null
+	cp /rom/etc/uhttpd.key /etc/ 2> /dev/null
+}
+
+update_061_to_062()
+{
+	# Preserve self signed certificates
+	cp /rom/etc/uhttpd.crt /etc/ 2> /dev/null
+	cp /rom/etc/uhttpd.key /etc/ 2> /dev/null
+}
+
+update_062_to_063()
+{
+	# Preserve self signed certificates
+	cp /rom/etc/uhttpd.crt /etc/ 2> /dev/null
+	cp /rom/etc/uhttpd.key /etc/ 2> /dev/null
+}
+
+update_063_to_064()
+{
+	# Preserve self signed certificates
+	cp /rom/etc/uhttpd.crt /etc/ 2> /dev/null
+	cp /rom/etc/uhttpd.key /etc/ 2> /dev/null
+
+	# update fastd for additional ipv6 option
+	cp /rom/etc/config/fastd /etc/config/fastd
+
+	# add correct community_url variable again
+	uci set freifunk.@settings[0].community_url="http://freifunk-schwaben.de"
+	uci commit freifunk
+}
+
+update_064_to_065()
+{
+	# Preserve self signed certificates
+	cp /rom/etc/uhttpd.crt /etc/ 2> /dev/null
+	cp /rom/etc/uhttpd.key /etc/ 2> /dev/null
+
+	# Not needed anymore
+	rm /etc/config/network_defaults
+}
+
+update_065_to_100()
+{
+	# Preserve self signed certificates
+	cp /rom/etc/uhttpd.crt /etc/ 2> /dev/null
+	cp /rom/etc/uhttpd.key /etc/ 2> /dev/null
+
+	cp /rom/etc/sysupgrade.conf /etc/sysupgrade.conf
+	cp /rom/etc/iproute2/rt_tables /etc/iproute2/rt_tables
+
+	# Create fresh /etc/sysctl.conf
+	cp /rom/etc/sysctl.conf /etc/sysctl.conf
+	cat >> /etc/sysctl.conf <<-  EOF
+
+	# increase neighbor table timings by a factor of 10
+	net.ipv6.neigh.default.gc_interval=300
+	net.ipv6.neigh.default.gc_stale_time=600
+	net.ipv6.neigh.default.base_reachable_time_ms=300
+
+	# by default, either accept_ra or forwarding is enabled
+	# disable both here, since LEDE handles both apart from the Linux kernel
+	net.ipv6.conf.all.accept_ra=0
+	net.ipv6.conf.default.accept_ra=0
+	net.ipv6.conf.br-freifunk.forwarding=0
+	net.ipv6.conf.br-lan.forwarding=0
+
+	#reboot on out of memory
+	vm.panic_on_oom=1
+
+	EOF
+
+	# Use correct ipv4 netmask for freifunk network
+	uci set network.freifunk.netmask="255.255.0.0"
+
+	# Create fresh /etc/firewall.user and local node section
+	uci -q delete network.freifunk.ip6addr
+	uci -q delete network.freifunk.ipaddr6
+	uci -q delete network.freifunk.ipaddr
+	uci -q delete network.fastd_mesh.mesh_no_rebroadcast
+	cp /rom/etc/firewall.user /etc/firewall.user
+	initial_local_node_setup
+	uci commit network
+
+	cp /rom/etc/hosts /etc/hosts
+	echo "10.33.127.0 node" >> /etc/hosts
+
+	cp /rom/etc/config/batman-adv /etc/config/batman-adv
+	cp /rom/etc/config/autoupdater /etc/config/autoupdater
+	cp /rom/etc/config/uhttpd /etc/config/uhttpd
+	cp /rom/etc/config/fastd /etc/config/fastd
+	cp /rom/etc/crontabs/root /etc/crontabs/root
+	cp /rom/etc/profile /etc/profile
+	cp /rom/etc/protocols /etc/protocols
+	cp /rom/etc/inittab /etc/inittab
+	cp /rom/etc/modules.d/73-sched /etc/modules.d/73-sched 2> /dev/null
+
+	# Rebuild /etc/config/system, many things has changed, keep hostname
+	local hostname="$(uci get system.@system[0].hostname)"
+	rm /etc/config/system
+	/bin/config_generate
+	uci set system.@system[0].hostname="$hostname"
+	uci commit system
+}
+
+update_100_to_200()
+{
+	# Preserve self signed certificates
+	cp /rom/etc/uhttpd.crt /etc/ 2> /dev/null
+	cp /rom/etc/uhttpd.key /etc/ 2> /dev/null
+
+	cp /rom/etc/config/fastd /etc/config/fastd
+
+	cp /rom/etc/firewall.user /etc/firewall.user
+	initial_local_node_setup
+	# no commit, keep firewall.user changes only
+	#uci commit network
+
+	uci set batman-adv.bat0.routing_algo='BATMAN_V'
+	uci commit batman-adv
+}
+
+update_200_to_210()
+{
+	# Preserve self signed certificates
+	cp /rom/etc/uhttpd.crt /etc/ 2> /dev/null
+	cp /rom/etc/uhttpd.key /etc/ 2> /dev/null
+
+	cp /rom/etc/profile /etc/profile
+	cp /rom/etc/group /etc/group
+
+	# Rebuild /etc/config/system
+	local hostname="$(uci get system.@system[0].hostname)"
+	rm /etc/config/system
+	/bin/config_generate
+	uci set system.@system[0].hostname="$hostname"
+	uci commit system
+
+	# Not needed anymore
+	rm -f /etc/config/batman-adv
+
+	# batman-adv config migration
+	network_bat0_migration() {
+		local cfg="$1" proto
+
+		config_get proto $cfg "proto"
+		if [ "$proto" = "batadv" -a $cfg != "bat0" ]; then
+			uci set network.$cfg.proto='batadv_hardif'
+			uci delete network.$cfg.mesh
+			uci set network.$cfg.master='bat0'
+		fi
+	}
+
+	config_load network
+	config_foreach network_bat0_migration interface
+
+	uci -q delete network.fastd_mesh
+	initial_batman_setup
+
+	uci commit network
+}
+
+update_210_to_220()
+{
+	# Preserve self signed certificates
+	cp /rom/etc/uhttpd.crt /etc/ 2> /dev/null
+	cp /rom/etc/uhttpd.key /etc/ 2> /dev/null
+
+	uci set system.@system[0].timezone='CET-1CEST,M3.5.0,M10.5.0/3'
+	uci commit system
+
+	cp /rom/etc/config/fastd /etc/config/fastd
+
+	uci set network.bat0.gw_mode=client
+	uci set network.bat0.aggregated_ogms=1
+	uci set network.bat0.bridge_loop_avoidance=1
+	uci set network.bat0.distributed_arp_table=1
+	uci commit network
+}
+
+start()
+{
+	echo "(I) Start freifunk_setup"
+
+	local from_version="$(uci -q get freifunk.@settings[0].version)"
+	local to_version="$(uci -c /rom/etc/config -q get freifunk.@settings[0].version)"
+
+	# Marker to check if the setup has already been run before
+	if [ -n "$(uci -q get freifunk.@settings[0].first_boot)" ]; then
+		uci -q delete freifunk.@settings[0].first_boot
+		from_version=""
+	fi
+
+	update_version() {
+		uci -q set freifunk.@settings[0].version="$to_version"
+		uci -q commit freifunk
+	}
+
+	echo "(I) Update from '$from_version' to '$to_version'"
+	case "$from_version" in
+		0.5.0*)
+			echo "(I) Apply update."
+			update_050_to_051
+			update_051_to_060
+			update_060_to_061
+			update_061_to_062
+			update_062_to_063
+			update_063_to_064
+			update_064_to_065
+			update_065_to_100
+			update_100_to_200
+			update_200_to_210
+			update_210_to_220
+			update_version
+			;;
+		0.5.1*)
+			echo "(I) Apply update."
+			update_051_to_060
+			update_060_to_061
+			update_061_to_062
+			update_062_to_063
+			update_063_to_064
+			update_064_to_065
+			update_065_to_100
+			update_100_to_200
+			update_200_to_210
+			update_210_to_220
+			update_version
+			;;
+		0.6.0*)
+			echo "(I) Apply update."
+			update_060_to_061
+			update_061_to_062
+			update_062_to_063
+			update_063_to_064
+			update_064_to_065
+			update_065_to_100
+			update_100_to_200
+			update_200_to_210
+			update_210_to_220
+			update_version
+			;;
+		0.6.1*)
+			echo "(I) Apply update."
+			update_061_to_062
+			update_062_to_063
+			update_063_to_064
+			update_064_to_065
+			update_065_to_100
+			update_100_to_200
+			update_200_to_210
+			update_210_to_220
+			update_version
+			;;
+		0.6.2*)
+			echo "(I) Apply update."
+			update_062_to_063
+			update_063_to_064
+			update_064_to_065
+			update_065_to_100
+			update_100_to_200
+			update_200_to_210
+			update_210_to_220
+			update_version
+			;;
+		0.6.3*)
+			echo "(I) Apply update."
+			update_063_to_064
+			update_064_to_065
+			update_065_to_100
+			update_100_to_200
+			update_200_to_210
+			update_210_to_220
+			update_version
+			;;
+		0.6.4*)
+			echo "(I) Apply update."
+			update_064_to_065
+			update_065_to_100
+			update_100_to_200
+			update_200_to_210
+			update_210_to_220
+			update_version
+			;;
+		0.6.5*)
+			echo "(I) Apply update."
+			update_065_to_100
+			update_100_to_200
+			update_200_to_210
+			update_210_to_220
+			update_version
+			;;
+		1.0.0*)
+			echo "(I) Apply update."
+			update_100_to_200
+			update_200_to_210
+			update_210_to_220
+			update_version
+			;;
+		2.0.0*)
+			echo "(I) Apply update."
+			update_200_to_210
+			update_210_to_220
+			update_version
+			;;
+		2.1.0*)
+			echo "(I) Apply update."
+			update_210_to_220
+			update_version
+			;;
+		"")
+			echo "(I) Start initial setup."
+			initial_setup
+			update_version
+			;;
+		*)
+			echo "(I) No configuration updater set. No idea what to do."
+			;;
+	esac
+
+	# fastd will be started when WAN becomes
+	# available by /etc/hotplug.d/iface/30-fastd
+	/etc/init.d/fastd disable
+
+	/etc/init.d/alfred enable
+	/etc/init.d/simple-radvd enable
+	/etc/init.d/freifunk_init enable
+
+	echo "(I) Done."
+}
+
+start
+sync
+
+exit 0

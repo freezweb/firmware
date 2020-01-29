@@ -1,0 +1,104 @@
+#!/bin/sh /etc/rc.common
+
+START=19
+
+
+#allow/block access via ssh/https from lan/wan/freifunk
+set_access() {
+	local src port default_target target
+	local from=`uci -q get freifunk.@settings[0].allow_access_from`
+
+	echo "(I) Freifunk: allow_access_from: '$from'"
+
+	#remove existing rules
+	for src in wan lan freifunk; do
+		for port in 22 443; do
+			local s="firewall.${src}${port}"
+			uci -q delete $s
+		done
+	done
+
+	find_default_target() {
+		local s="$1" src="$2" name
+
+		config_get name "$s" 'name'
+		if [ "$src" == "$name" ]; then
+			config_get default_target "$s" 'input'
+			return 1
+		fi
+	}
+
+	#add rule to allow/reject ssh/https access
+	config_load firewall
+	for src in wan lan freifunk; do
+		default_target=""
+		config_foreach find_default_target 'zone' $src
+		list_contains from "$src" && target=ACCEPT || target=REJECT
+		[ "$target" = "$default_target" ] && continue
+		for port in 22 443; do
+			local s="firewall.${src}${port}"
+			uci set $s=rule
+			uci set $s.src=$src
+			uci set $s.dest_port=$port
+			uci set $s.target=$target
+			uci set $s.proto=tcp
+		done
+	done
+}
+
+random_mac() {
+	echo -n 02; dd bs=1 count=5 if=/dev/random 2>/dev/null | hexdump -v -e '/1 ":%02x"'
+}
+
+# batman-adv wants unique MAC addresses for each interface
+set_macs() {
+	network_set_macaddr() {
+		local proto
+
+		config_get proto "$1" "proto"
+
+		if [ "$proto" = "batadv" ]; then
+			uci set network.$1.macaddr="$(random_mac)"
+		fi
+	}
+
+	wireless_set_macaddr() {
+		uci set wireless.$1.macaddr="$(random_mac)"
+	}
+
+	config_load network
+	config_foreach network_set_macaddr interface
+
+	config_load wireless
+	config_foreach wireless_set_macaddr wifi-iface
+}
+
+set_hostname()
+{
+	local hostname="$(uci -q get system.@system[0].hostname)"
+	local name="$(uci -q get freifunk.@settings[0].name)"
+
+	#sanitize name
+	name="$(echo -n \"$name\" | sed -e 's/[^A-Za-z0-9]//g' -e 's/^[0-9]//g')"
+
+	if [ -n "$name" -a "$hostname" != "$name" ]; then
+		uci set system.@system[0].hostname="$name"
+		uci commit system
+
+		uci set network.wan.hostname="$name"
+		uci commit network
+	fi
+}
+
+start()
+{
+	exec >/tmp/freifunk_init.log 2>&1
+
+	echo "(I) Freifunk: start freifunk_init"
+
+	#set_macs
+	set_access
+	set_hostname
+
+	echo "(I) Freifunk: done freifunk_init"
+}
